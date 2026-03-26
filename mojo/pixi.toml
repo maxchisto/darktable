@@ -1,0 +1,14 @@
+[workspace]
+name = "darktable-mojo"
+authors = ["maxchisto <max.chisto@gmail.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+build-lib   = "mojo build -I . iop/sigmoid/lib.mojo --emit shared-lib -o libsigmoid_mojo.so"
+bench       = "mojo bench/sigmoid_bench.mojo"
+
+[dependencies]
+mojo = ">=0.26.3.0.dev2026031105,<0.27"
+max = ">=26.3.0.dev2026031105,<27"

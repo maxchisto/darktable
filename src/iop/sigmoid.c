@@ -27,9 +27,11 @@
 #include "gui/gtk.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
+#include "common/opencl.h"
 
 #include <gtk/gtk.h>
 #include <stdlib.h>
+#include <dlfcn.h>
 
 DT_MODULE_INTROSPECTION(3, dt_iop_sigmoid_params_t)
 
@@ -180,10 +182,38 @@ typedef struct dt_iop_sigmoid_gui_data_t
   dt_gui_collapsible_section_t display_luminance_section, primaries_section;
 } dt_iop_sigmoid_gui_data_t;
 
+typedef struct {
+  float white_target[4];
+  float black_target[4];
+  float paper_exposure[4];
+  float film_fog[4];
+  float film_power[4];
+  float paper_power[4];
+  float contrast_power[4];
+  float skew_power[4];
+  float hue_preservation[4];
+  float pipe_to_base[16];
+  float base_to_rendering[16];
+  float rendering_to_pipe[16];
+} SigmoidMojoParams;
+
+typedef void (*mojo_init_fn)(uintptr_t *ctx, int use_gpu);
+typedef void (*mojo_destroy_fn)(uintptr_t ctx);
+typedef void (*mojo_rgb_ratio_fn)(uintptr_t ctx, float *in, float *out, int32_t width, int32_t height, void *params);
+typedef void (*mojo_per_channel_fn)(uintptr_t ctx, float *in, float *out, int32_t width, int32_t height, void *params);
+
 typedef struct dt_iop_sigmoid_global_data_t
 {
   int kernel_sigmoid_loglogistic_per_channel;
   int kernel_sigmoid_loglogistic_rgb_ratio;
+  
+  void *mojo_lib;
+  uintptr_t mojo_ctx_cpu;
+  uintptr_t mojo_ctx_gpu;
+  mojo_init_fn mojo_init;
+  mojo_destroy_fn mojo_destroy;
+  mojo_rgb_ratio_fn mojo_rgb_ratio;
+  mojo_per_channel_fn mojo_per_channel;
 } dt_iop_sigmoid_global_data_t;
 
 
@@ -760,6 +790,40 @@ void process_loglogistic_per_channel(dt_develop_t *dev,
   }
 }
 
+static SigmoidMojoParams _build_mojo_params(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece)
+{
+  const dt_iop_sigmoid_data_t *d = piece->data;
+  SigmoidMojoParams p = {0};
+
+  for(int i = 0; i < 4; i++) {
+    p.white_target[i] = d->white_target;
+    p.black_target[i] = d->black_target;
+    p.paper_exposure[i] = d->paper_exposure;
+    p.film_fog[i] = d->film_fog;
+    p.film_power[i] = d->film_power;
+    p.paper_power[i] = d->paper_power;
+    p.contrast_power[i] = d->film_power;
+    p.skew_power[i] = d->paper_power;
+    p.hue_preservation[i] = d->hue_preservation;
+  }
+
+  const dt_iop_order_iccprofile_info_t *pipe_work_profile = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  const dt_iop_order_iccprofile_info_t *base_profile = _get_base_profile(self->dev, pipe_work_profile, d->base_primaries);
+  dt_colormatrix_t pipe_to_base_transposed, base_to_rendering_transposed, rendering_to_pipe_transposed;
+  dt_colormatrix_t pipe_to_base, base_to_rendering, rendering_to_pipe;
+  
+  _calculate_adjusted_primaries(d, pipe_work_profile, base_profile, pipe_to_base_transposed, base_to_rendering_transposed, rendering_to_pipe_transposed);
+  transpose_3xSSE(pipe_to_base_transposed, pipe_to_base);
+  transpose_3xSSE(base_to_rendering_transposed, base_to_rendering);
+  transpose_3xSSE(rendering_to_pipe_transposed, rendering_to_pipe);
+
+  memcpy(p.pipe_to_base, pipe_to_base, sizeof(pipe_to_base));
+  memcpy(p.base_to_rendering, base_to_rendering, sizeof(base_to_rendering));
+  memcpy(p.rendering_to_pipe, rendering_to_pipe, sizeof(rendering_to_pipe));
+
+  return p;
+}
+
 /** process, all real work is done here. */
 void process(dt_iop_module_t *self,
              dt_dev_pixelpipe_iop_t *piece,
@@ -768,8 +832,22 @@ void process(dt_iop_module_t *self,
              const dt_iop_roi_t *const roi_in,
              const dt_iop_roi_t *const roi_out)
 {
-  // this is called for preview and full pipe separately, each with its own pixelpipe piece.
   const dt_iop_sigmoid_data_t *module_data = piece->data;
+  const dt_iop_sigmoid_global_data_t *gd = self->global_data;
+
+  if(gd && gd->mojo_lib && gd->mojo_per_channel && gd->mojo_rgb_ratio)
+  {
+    SigmoidMojoParams p = _build_mojo_params(self, piece);
+    const int w = roi_in->width, h = roi_in->height;
+    int use_gpu = dt_opencl_is_enabled() ? 1 : 0;
+    uintptr_t ctx = use_gpu ? gd->mojo_ctx_gpu : gd->mojo_ctx_cpu;
+    
+    if(module_data->color_processing == DT_SIGMOID_METHOD_PER_CHANNEL)
+      gd->mojo_per_channel(ctx, (float *)ivoid, (float *)ovoid, w, h, &p);
+    else
+      gd->mojo_rgb_ratio(ctx, (float *)ivoid, (float *)ovoid, w, h, &p);
+    return;
+  }
 
   if(module_data->color_processing == DT_SIGMOID_METHOD_PER_CHANNEL)
   {
@@ -781,87 +859,42 @@ void process(dt_iop_module_t *self,
   }
 }
 
-#ifdef HAVE_OPENCL
-int process_cl(dt_iop_module_t *self,
-               dt_dev_pixelpipe_iop_t *piece,
-               cl_mem dev_in,
-               cl_mem dev_out,
-               const dt_iop_roi_t *const roi_in,
-               const dt_iop_roi_t *const roi_out)
-{
-  const dt_iop_sigmoid_data_t *const d = piece->data;
-  const dt_iop_sigmoid_global_data_t *const gd = self->global_data;
 
-  cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
-  const int devid = piece->pipe->devid;
-  const int width = roi_in->width;
-  const int height = roi_in->height;
-
-  const float white_target = d->white_target;
-  const float paper_exp = d->paper_exposure;
-  const float film_fog = d->film_fog;
-  const float contrast_power = d->film_power;
-  const float skew_power = d->paper_power;
-
-  const dt_iop_order_iccprofile_info_t *pipe_work_profile = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
-  const dt_iop_order_iccprofile_info_t *base_profile = _get_base_profile(self->dev, pipe_work_profile, d->base_primaries);
-  dt_colormatrix_t pipe_to_base_transposed, base_to_rendering_transposed,
-      rendering_to_pipe_transposed, pipe_to_base, base_to_rendering, rendering_to_pipe;
-  _calculate_adjusted_primaries(d, pipe_work_profile, base_profile, pipe_to_base_transposed, base_to_rendering_transposed, rendering_to_pipe_transposed);
-  transpose_3xSSE(pipe_to_base_transposed, pipe_to_base);
-  transpose_3xSSE(base_to_rendering_transposed, base_to_rendering);
-  transpose_3xSSE(rendering_to_pipe_transposed, rendering_to_pipe);
-  const cl_mem dev_pipe_to_base
-      = dt_opencl_copy_host_to_device_constant(devid, sizeof(pipe_to_base), pipe_to_base);
-  const cl_mem dev_base_to_rendering
-      = dt_opencl_copy_host_to_device_constant(devid, sizeof(base_to_rendering), base_to_rendering);
-  const cl_mem dev_rendering_to_pipe
-      = dt_opencl_copy_host_to_device_constant(devid, sizeof(rendering_to_pipe), rendering_to_pipe);
-  if(dev_pipe_to_base == NULL || dev_base_to_rendering == NULL || dev_rendering_to_pipe == NULL)
-    goto cleanup;
-
-  if(d->color_processing == DT_SIGMOID_METHOD_PER_CHANNEL)
-  {
-    const float hue_preservation = d->hue_preservation;
-    err = dt_opencl_enqueue_kernel_2d_args(
-        devid, gd->kernel_sigmoid_loglogistic_per_channel, width, height, CLARG(dev_in), CLARG(dev_out),
-        CLARG(width), CLARG(height), CLARG(white_target), CLARG(paper_exp), CLARG(film_fog), CLARG(contrast_power),
-        CLARG(skew_power), CLARG(hue_preservation), CLARG(dev_pipe_to_base), CLARG(dev_base_to_rendering), CLARG(dev_rendering_to_pipe));
-  }
-  else
-  {
-    const float black_target = d->black_target;
-
-    err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_sigmoid_loglogistic_rgb_ratio, width, height,
-                                           CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height),
-                                           CLARG(white_target), CLARG(black_target), CLARG(paper_exp),
-                                           CLARG(film_fog), CLARG(contrast_power), CLARG(skew_power));
-  }
-
-cleanup:
-  dt_opencl_release_mem_object(dev_pipe_to_base);
-  dt_opencl_release_mem_object(dev_base_to_rendering);
-  dt_opencl_release_mem_object(dev_rendering_to_pipe);
-  return err;
-}
-#endif // HAVE_OPENCL
 
 void init_global(dt_iop_module_so_t *self)
 {
-  const int program = 36; // sigmoid.cl, from programs.conf
-  dt_iop_sigmoid_global_data_t *gd = malloc(sizeof(dt_iop_sigmoid_global_data_t));
-
+  dt_iop_sigmoid_global_data_t *gd = calloc(1, sizeof(dt_iop_sigmoid_global_data_t));
   self->data = gd;
-  gd->kernel_sigmoid_loglogistic_per_channel = dt_opencl_create_kernel(program, "sigmoid_loglogistic_per_channel");
-  gd->kernel_sigmoid_loglogistic_rgb_ratio = dt_opencl_create_kernel(program, "sigmoid_loglogistic_rgb_ratio");
+
+  gd->mojo_lib = dlopen("libsigmoid_mojo.so", RTLD_LAZY | RTLD_LOCAL);
+  if(gd->mojo_lib)
+  {
+    gd->mojo_init = (mojo_init_fn)dlsym(gd->mojo_lib, "sigmoid_mojo_init");
+    gd->mojo_destroy = (mojo_destroy_fn)dlsym(gd->mojo_lib, "sigmoid_mojo_destroy");
+    gd->mojo_rgb_ratio = (mojo_rgb_ratio_fn)dlsym(gd->mojo_lib, "sigmoid_mojo_rgb_ratio");
+    gd->mojo_per_channel = (mojo_per_channel_fn)dlsym(gd->mojo_lib, "sigmoid_mojo_per_channel");
+
+    if (gd->mojo_init && gd->mojo_destroy)
+    {
+      gd->mojo_init(&gd->mojo_ctx_cpu, 0); // CPU context
+      gd->mojo_init(&gd->mojo_ctx_gpu, 1); // GPU context
+    }
+  }
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
 {
-  const dt_iop_sigmoid_global_data_t *gd = self->data;
-  dt_opencl_free_kernel(gd->kernel_sigmoid_loglogistic_per_channel);
-  dt_opencl_free_kernel(gd->kernel_sigmoid_loglogistic_rgb_ratio);
-  free(self->data);
+  dt_iop_sigmoid_global_data_t *gd = self->data;
+  if(gd)
+  {
+    if(gd->mojo_destroy)
+    {
+      if(gd->mojo_ctx_cpu) gd->mojo_destroy(gd->mojo_ctx_cpu);
+      if(gd->mojo_ctx_gpu) gd->mojo_destroy(gd->mojo_ctx_gpu);
+    }
+    if(gd->mojo_lib) dlclose(gd->mojo_lib);
+    free(gd);
+  }
   self->data = NULL;
 }
 

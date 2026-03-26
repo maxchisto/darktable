@@ -1,10 +1,12 @@
 from gpu import block_dim, block_idx, thread_idx
 from gpu.host import DeviceContext, DeviceBuffer, Dim, HostBuffer
+from gpu.host.compile import get_gpu_target
 from layout import Layout, LayoutTensor
 from utils import Index, IndexList
 from math import ceildiv, isnan, sqrt, pow, max, min
 from benchmark import Bench, BenchConfig, Bencher, BenchId
 from algorithm.functional import elementwise
+from sys import simd_width_of, argv, align_of
 
 # Configuration
 comptime WIDTH = 6016
@@ -12,9 +14,7 @@ comptime HEIGHT = 4016
 comptime CHANNELS = 4
 comptime IMAGE_LAYOUT = Layout.row_major(HEIGHT, WIDTH, CHANNELS)
 comptime DTYPE = DType.float32
-
-
-# Removed Pixel struct to use 3D LayoutTensor directly as requested
+comptime SIMD_WIDTH = simd_width_of[DTYPE, target=get_gpu_target()]()
 
 
 @always_inline
@@ -38,10 +38,7 @@ fn generalized_loglogistic_sigmoid_scalar(
 
 @always_inline
 fn apply_sigmoid_rgb_ratio(
-    in_r: Float32,
-    in_g: Float32,
-    in_b: Float32,
-    in_a: Float32,
+    in_pix: SIMD[DType.float32, 4],
     white_target: Float32,
     black_target: Float32,
     paper_exp: Float32,
@@ -50,17 +47,19 @@ fn apply_sigmoid_rgb_ratio(
     paper_power: Float32,
 ) -> SIMD[DType.float32, 4]:
     # Desaturate negative values
-    var avg = max((in_r + in_g + in_b) / 3.0, Float32(0.0))
-    var min_v = min(min(in_r, in_g), in_b)
+    var rgb = in_pix
+    rgb[3] = 0  # Zero alpha for sum
+    var avg = max(rgb.reduce_add() / 3.0, Float32(0.0))
+    var min_v = min(min(in_pix[0], in_pix[1]), in_pix[2])
     var sat = Float32(1.0)
     if min_v < 0.0:
         sat = -avg / (min_v - avg)
 
-    var p_r = avg + sat * (in_r - avg)
-    var p_g = avg + sat * (in_g - avg)
-    var p_b = avg + sat * (in_b - avg)
+    var p_r = avg + sat * (in_pix[0] - avg)
+    var p_g = avg + sat * (in_pix[1] - avg)
+    var p_b = avg + sat * (in_pix[2] - avg)
 
-    var luma = (p_r + p_g + p_b) / 3.0
+    var luma = avg
     var mapped_luma = generalized_loglogistic_sigmoid_scalar(
         luma, white_target, paper_exp, film_fog, film_power, paper_power
     )
@@ -93,16 +92,13 @@ fn apply_sigmoid_rgb_ratio(
         mapped_luma + chroma_f * (p_r - mapped_luma),
         mapped_luma + chroma_f * (p_g - mapped_luma),
         mapped_luma + chroma_f * (p_b - mapped_luma),
-        in_a,
+        in_pix[3],
     )
 
 
 @always_inline
 fn apply_sigmoid_per_channel(
-    in_r: Float32,
-    in_g: Float32,
-    in_b: Float32,
-    in_a: Float32,
+    in_pix: SIMD[DType.float32, 4],
     white_target: Float32,
     paper_exp: Float32,
     film_fog: Float32,
@@ -113,18 +109,27 @@ fn apply_sigmoid_per_channel(
     base_to_rendering: SIMD[DType.float32, 16],
     rendering_to_pipe: SIMD[DType.float32, 16],
 ) -> SIMD[DType.float32, 4]:
-    # 1. Transform to base space
+    # 1. Transform to base space using vectorized dot products
+    var v = in_pix
+    v[3] = 0  # Ensure alpha doesn't contribute to RGB matrix multiply
     var i_r = (
-        pipe_to_base[0] * in_r + pipe_to_base[1] * in_g + pipe_to_base[2] * in_b
-    )
+        SIMD[DType.float32, 4](
+            pipe_to_base[0], pipe_to_base[1], pipe_to_base[2], 0
+        )
+        * v
+    ).reduce_add()
     var i_g = (
-        pipe_to_base[4] * in_r + pipe_to_base[5] * in_g + pipe_to_base[6] * in_b
-    )
+        SIMD[DType.float32, 4](
+            pipe_to_base[4], pipe_to_base[5], pipe_to_base[6], 0
+        )
+        * v
+    ).reduce_add()
     var i_b = (
-        pipe_to_base[8] * in_r
-        + pipe_to_base[9] * in_g
-        + pipe_to_base[10] * in_b
-    )
+        SIMD[DType.float32, 4](
+            pipe_to_base[8], pipe_to_base[9], pipe_to_base[10], 0
+        )
+        * v
+    ).reduce_add()
 
     # 2. Desaturate negative
     var avg = max((i_r + i_g + i_b) / 3.0, Float32(0.0))
@@ -137,21 +142,25 @@ fn apply_sigmoid_per_channel(
     i_b = avg + sat * (i_b - avg)
 
     # 3. Transform to rendering space
+    var iv = SIMD[DType.float32, 4](i_r, i_g, i_b, 0)
     var r_r = (
-        base_to_rendering[0] * i_r
-        + base_to_rendering[1] * i_g
-        + base_to_rendering[2] * i_b
-    )
+        SIMD[DType.float32, 4](
+            base_to_rendering[0], base_to_rendering[1], base_to_rendering[2], 0
+        )
+        * iv
+    ).reduce_add()
     var r_g = (
-        base_to_rendering[4] * i_r
-        + base_to_rendering[5] * i_g
-        + base_to_rendering[6] * i_b
-    )
+        SIMD[DType.float32, 4](
+            base_to_rendering[4], base_to_rendering[5], base_to_rendering[6], 0
+        )
+        * iv
+    ).reduce_add()
     var r_b = (
-        base_to_rendering[8] * i_r
-        + base_to_rendering[9] * i_g
-        + base_to_rendering[10] * i_b
-    )
+        SIMD[DType.float32, 4](
+            base_to_rendering[8], base_to_rendering[9], base_to_rendering[10], 0
+        )
+        * iv
+    ).reduce_add()
 
     # 4. Per-channel sigmoid curves
     var pc_r = generalized_loglogistic_sigmoid_scalar(
@@ -281,23 +290,27 @@ fn apply_sigmoid_per_channel(
             res_r = res_min
 
     # 6. Transform to pipe space
+    var rv = SIMD[DType.float32, 4](res_r, res_g, res_b, 0)
     var out_r = (
-        rendering_to_pipe[0] * res_r
-        + rendering_to_pipe[1] * res_g
-        + rendering_to_pipe[2] * res_b
-    )
+        SIMD[DType.float32, 4](
+            rendering_to_pipe[0], rendering_to_pipe[1], rendering_to_pipe[2], 0
+        )
+        * rv
+    ).reduce_add()
     var out_g = (
-        rendering_to_pipe[4] * res_r
-        + rendering_to_pipe[5] * res_g
-        + rendering_to_pipe[6] * res_b
-    )
+        SIMD[DType.float32, 4](
+            rendering_to_pipe[4], rendering_to_pipe[5], rendering_to_pipe[6], 0
+        )
+        * rv
+    ).reduce_add()
     var out_b = (
-        rendering_to_pipe[8] * res_r
-        + rendering_to_pipe[9] * res_g
-        + rendering_to_pipe[10] * res_b
-    )
+        SIMD[DType.float32, 4](
+            rendering_to_pipe[8], rendering_to_pipe[9], rendering_to_pipe[10], 0
+        )
+        * rv
+    ).reduce_add()
 
-    return SIMD[DType.float32, 4](out_r, out_g, out_b, in_a)
+    return SIMD[DType.float32, 4](out_r, out_g, out_b, in_pix[3])
 
 
 fn run_sigmoid_rgb_ratio(
@@ -315,27 +328,49 @@ fn run_sigmoid_rgb_ratio(
     @parameter
     @always_inline
     fn rgb_ratio_closure[
-        width: Int, rank: Int, alignment: Int
+        # `width` = SIMD_WIDTH: number of consecutive pixels processed per GPU thread.
+        # Channels are still handled scalar per pixel (cross-channel math prevents
+        # true float32-SIMD across channels). The benefit is wider memory transactions:
+        # we load/store width*4 floats in one instruction, improving memory throughput.
+        width: Int,
+        rank: Int,
+        alignment: Int,
     ](indices: IndexList[rank]) capturing -> None:
-        var px_idx = indices[0]
-        var y = px_idx // WIDTH
-        var x = px_idx % WIDTH
-        var pix = input.load[width=4](Index(y, x, 0))
-        var res = apply_sigmoid_rgb_ratio(
-            pix[0],
-            pix[1],
-            pix[2],
-            pix[3],
-            white_target,
-            black_target,
-            paper_exp,
-            film_fog,
-            film_power,
-            paper_power,
-        )
-        output.store[width=4](Index(y, x, 0), res)
+        var base_px = indices[0]  # first pixel in this SIMD_WIDTH-wide batch
+        var base_y = base_px // WIDTH
+        var base_x = base_px % WIDTH
 
-    elementwise[rgb_ratio_closure, 1, target="gpu"](num_pixels, ctx)
+        # Load all SIMD_WIDTH pixels in one wide transaction.
+        # Pixels are physically contiguous in the flat row-major buffer,
+        # so this is valid even when the batch straddles a row boundary.
+        comptime WIDE = width * 4
+        var all_pix = input.aligned_load[width=WIDE](Index(base_y, base_x, 0))
+        var all_out = SIMD[DType.float32, WIDE](0)
+        comptime for i in range(width):
+            comptime c = i * 4
+            var res = apply_sigmoid_rgb_ratio(
+                SIMD[DType.float32, 4](
+                    all_pix[c + 0],
+                    all_pix[c + 1],
+                    all_pix[c + 2],
+                    all_pix[c + 3]
+                ),
+                white_target,
+                black_target,
+                paper_exp,
+                film_fog,
+                film_power,
+                paper_power,
+            )
+            all_out[c + 0] = res[0]
+            all_out[c + 1] = res[1]
+            all_out[c + 2] = res[2]
+            all_out[c + 3] = res[3]
+        output.store[width=WIDE, store_alignment=16](
+            Index(base_y, base_x, 0), all_out
+        )
+
+    elementwise[rgb_ratio_closure, SIMD_WIDTH, target="gpu"](num_pixels, ctx)
 
 
 fn run_sigmoid_per_channel(
@@ -356,30 +391,52 @@ fn run_sigmoid_per_channel(
     @parameter
     @always_inline
     fn per_channel_closure[
-        width: Int, rank: Int, alignment: Int
+        # `width` = SIMD_WIDTH: number of consecutive pixels processed per GPU thread.
+        # Channels are still handled scalar per pixel (hue sort + cross-channel math
+        # prevents true float32-SIMD across channels). The benefit is wider memory
+        # transactions: we amortize load/store overhead across width pixels.
+        width: Int,
+        rank: Int,
+        alignment: Int,
     ](indices: IndexList[rank]) capturing -> None:
-        var px_idx = indices[0]
-        var y = px_idx // WIDTH
-        var x = px_idx % WIDTH
-        var pix = input.load[width=4](Index(y, x, 0))
-        var res = apply_sigmoid_per_channel(
-            pix[0],
-            pix[1],
-            pix[2],
-            pix[3],
-            white_target,
-            paper_exp,
-            film_fog,
-            contrast_power,
-            skew_power,
-            hue_preservation,
-            pipe_to_base,
-            base_to_rendering,
-            rendering_to_pipe,
-        )
-        output.store[width=4](Index(y, x, 0), res)
+        var base_px = indices[0]  # first pixel in this SIMD_WIDTH-wide batch
+        var base_y = base_px // WIDTH
+        var base_x = base_px % WIDTH
 
-    elementwise[per_channel_closure, 1, target="gpu"](num_pixels, ctx)
+        # Load all SIMD_WIDTH pixels in one wide transaction.
+        # Pixels are physically contiguous in the flat row-major buffer,
+        # so this is valid even when the batch straddles a row boundary.
+        comptime WIDE = width * 4
+        var all_pix = input.aligned_load[width=WIDE](Index(base_y, base_x, 0))
+        var all_out = SIMD[DType.float32, WIDE](0)
+        comptime for i in range(width):
+            comptime c = i * 4
+            var res = apply_sigmoid_per_channel(
+                SIMD[DType.float32, 4](
+                    all_pix[c + 0],
+                    all_pix[c + 1],
+                    all_pix[c + 2],
+                    all_pix[c + 3]
+                ),
+                white_target,
+                paper_exp,
+                film_fog,
+                contrast_power,
+                skew_power,
+                hue_preservation,
+                pipe_to_base,
+                base_to_rendering,
+                rendering_to_pipe,
+            )
+            all_out[c + 0] = res[0]
+            all_out[c + 1] = res[1]
+            all_out[c + 2] = res[2]
+            all_out[c + 3] = res[3]
+        output.store[width=WIDE, store_alignment=16](
+            Index(base_y, base_x, 0), all_out
+        )
+
+    elementwise[per_channel_closure, SIMD_WIDTH, target="gpu"](num_pixels, ctx)
 
 
 fn main() raises:

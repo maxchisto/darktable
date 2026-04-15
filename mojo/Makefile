@@ -13,8 +13,5 @@ libsigmoid_mojo.so: iop/sigmoid/lib.mojo iop/sigmoid/kernels.mojo
 install: libsigmoid_mojo.so
 	sudo cp libsigmoid_mojo.so $(PLUGIN_DIR)/
 
-bench:
-	$(MOJO) bench/sigmoid_bench.mojo
-
 clean:
 	rm -f libsigmoid_mojo.so

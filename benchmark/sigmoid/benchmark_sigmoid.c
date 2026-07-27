@@ -148,14 +148,10 @@ int main() {
     // Create command queue with profiling enabled
     cl_queue_properties props[] = { CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0 };
     queue = clCreateCommandQueueWithProperties(context, device, props, &err);
-    if (err != CL_SUCCESS) {
-        // Fallback for older OpenCL versions if needed, but we targeting 2.2 above
-        queue = clCreateCommandQueue(context, device, CL_QUEUE_PROFILING_ENABLE, &err);
-    }
     CHECK_CL(err);
 
     // Load kernel source
-    const char* kernel_path = "../data/kernels/sigmoid.cl";
+    const char* kernel_path = "../../data/kernels/sigmoid.cl";
     printf("Reading kernel source from %s...\n", kernel_path);
     char* source = read_file(kernel_path);
     if (!source) {
@@ -168,7 +164,7 @@ int main() {
     CHECK_CL(err);
     
     // Need to point to the directory containing common.h and colorspace.h
-    const char* options = "-I ../data/kernels/";
+    const char* options = "-I ../../data/kernels/";
     err = clBuildProgram(program, 1, &device, options, NULL, NULL);
     if (err != CL_SUCCESS) {
         char build_log[16384];
@@ -182,9 +178,6 @@ int main() {
     CHECK_CL(err);
     cl_kernel kernel_rgb_ratio = clCreateKernel(program, "sigmoid_loglogistic_rgb_ratio", &err);
     CHECK_CL(err);
-
-    CHECK_CL(clGetPlatformIDs(1, &platform, &num_platforms));
-    CHECK_CL(clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL));
 
     cl_image_format format = { CL_RGBA, CL_FLOAT };
     cl_image_desc desc = { CL_MEM_OBJECT_IMAGE2D, width, height, 0, 0, 0, 0, 0, 0, {0} };
@@ -233,10 +226,11 @@ int main() {
     CHECK_CL(clSetKernelArg(kernel_per_channel, 11, sizeof(cl_mem), &d_mat2));
     CHECK_CL(clSetKernelArg(kernel_per_channel, 12, sizeof(cl_mem), &d_mat3));
 
-    int warmup_iters = 100;
-    int iterations = 1000;
+    int warmup_iters = 20;
+    int iterations = 200;
+    int batch_size = 20;
+    int num_batches = iterations / batch_size;
     cl_event event;
-    double total_time = 0;
 
     printf("  Warmup (%d iterations)...\n", warmup_iters);
     for (int i = 0; i < warmup_iters; i++) {
@@ -245,7 +239,8 @@ int main() {
     }
     clFinish(queue);
 
-    printf("  Benchmarking (%d iterations)...\n", iterations);
+    printf("  Benchmarking (%d iterations, batch_size=%d)...\n", iterations, batch_size);
+    double *times = (double*)malloc(iterations * sizeof(double));
     for (int i = 0; i < iterations; i++) {
         size_t global_work_size[2] = { width, height };
         CHECK_CL(clEnqueueNDRangeKernel(queue, kernel_per_channel, 2, NULL, global_work_size, NULL, 0, NULL, &event));
@@ -254,10 +249,29 @@ int main() {
         cl_ulong start, end;
         clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start), &start, NULL);
         clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end), &end, NULL);
-        total_time += (double)(end - start) / 1000000.0; // ns to ms
+        times[i] = (double)(end - start) / 1000000.0; // ns to ms
         clReleaseEvent(event);
     }
-    printf("  Average Time: %.4f ms\n", total_time / iterations);
+
+    double *batch_means = (double*)malloc(num_batches * sizeof(double));
+    double overall_sum = 0;
+    for (int b = 0; b < num_batches; b++) {
+        double batch_sum = 0;
+        for (int j = 0; j < batch_size; j++)
+            batch_sum += times[b * batch_size + j];
+        batch_means[b] = batch_sum / batch_size;
+        overall_sum += batch_means[b];
+    }
+    double mean = overall_sum / num_batches;
+    double sum_sq = 0;
+    for (int b = 0; b < num_batches; b++) {
+        double d = batch_means[b] - mean;
+        sum_sq += d * d;
+    }
+    double std = sqrt(sum_sq / num_batches);
+    free(batch_means);
+    free(times);
+    printf("  Mean: %.4f ms, Std: %.4f ms\n", mean, std);
 
     // Save result of the last iteration to a file
     float* h_out = (float*)malloc(img_size);
@@ -289,8 +303,8 @@ int main() {
     }
     clFinish(queue);
 
-    total_time = 0;
-    printf("  Benchmarking (%d iterations)...\n", iterations);
+    printf("  Benchmarking (%d iterations, batch_size=%d)...\n", iterations, batch_size);
+    times = (double*)malloc(iterations * sizeof(double));
     for (int i = 0; i < iterations; i++) {
         size_t global_work_size[2] = { width, height };
         CHECK_CL(clEnqueueNDRangeKernel(queue, kernel_rgb_ratio, 2, NULL, global_work_size, NULL, 0, NULL, &event));
@@ -299,10 +313,29 @@ int main() {
         cl_ulong start, end;
         clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start), &start, NULL);
         clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end), &end, NULL);
-        total_time += (double)(end - start) / 1000000.0; // ns to ms
+        times[i] = (double)(end - start) / 1000000.0; // ns to ms
         clReleaseEvent(event);
     }
-    printf("  Average Time: %.4f ms\n", total_time / iterations);
+
+    batch_means = (double*)malloc(num_batches * sizeof(double));
+    overall_sum = 0;
+    for (int b = 0; b < num_batches; b++) {
+        double batch_sum = 0;
+        for (int j = 0; j < batch_size; j++)
+            batch_sum += times[b * batch_size + j];
+        batch_means[b] = batch_sum / batch_size;
+        overall_sum += batch_means[b];
+    }
+    mean = overall_sum / num_batches;
+    sum_sq = 0;
+    for (int b = 0; b < num_batches; b++) {
+        double d = batch_means[b] - mean;
+        sum_sq += d * d;
+    }
+    std = sqrt(sum_sq / num_batches);
+    free(batch_means);
+    free(times);
+    printf("  Mean: %.4f ms, Std: %.4f ms\n", mean, std);
 
     // Save result of the last iteration to a file
     h_out = (float*)malloc(img_size);
